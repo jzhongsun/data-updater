@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 import sys
+import time
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -77,9 +78,45 @@ STOCK_CURRENT_COLUMN_MAPPING = {
 }
 
 
+# 重试配置：分页请求与 get total 共用
+_EM_RETRIEVE_MAX_ATTEMPTS = 3
+_EM_RETRIEVE_RETRY_DELAY = 1.5
+_EM_RETRIEVE_HTTP_TIMEOUT = 12.0
+
+
+def http_get_json_with_retry(
+    client: httpx.Client,
+    url: str,
+    params: dict[str, Any],
+    *,
+    timeout: float = _EM_RETRIEVE_HTTP_TIMEOUT,
+    max_attempts: int = _EM_RETRIEVE_MAX_ATTEMPTS,
+    retry_delay: float = _EM_RETRIEVE_RETRY_DELAY,
+    label: str = "http",
+) -> dict[str, Any] | None:
+    """
+    使用给定 client 发起 GET 请求，解析 JSON；失败则重试，不抛错。
+    成功返回解析后的 dict，重试耗尽返回 None。
+    """
+    last_err: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = client.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            logger.warning("%s attempt=%s: %s", label, attempt + 1, e)
+            if attempt < max_attempts - 1:
+                time.sleep(retry_delay)
+    logger.warning("%s exhausted retries: %s", label, last_err)
+    return None
+
+
 def em_retrieve_stock_rank_current() -> tuple[pd.DataFrame, int]:
     """
     获取当前全市场股票行情（多线程分页抓取，加速请求）。
+    分页请求与 get total 均带重试，失败不轻易抛错。
     """
     limit = 100
     url = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -103,21 +140,13 @@ def em_retrieve_stock_rank_current() -> tuple[pd.DataFrame, int]:
         params = params_template.copy()
         params["pn"] = page
         params["pz"] = page_size
-        print(
-            f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}], url = {url}, params = {params}'
+        js = http_get_json_with_retry(
+            client, url, params,
+            label=f"fetch_page page={page}",
         )
-        try:
-            response = client.get(url, params=params, timeout=10.0)
-            response.raise_for_status()
-            response_json = response.json()
-        except Exception as e:
-            print(f"fetch_page error, page={page}: {e}", file=sys.stderr)
+        if not js:
             return []
-
-        if not response_json:
-            return []
-
-        data: dict[str, Any] = response_json.get("data") or {}
+        data: dict[str, Any] = js.get("data") or {}
         diff: list[dict[str, Any]] = data.get("diff") or []
         return diff
 
@@ -152,24 +181,20 @@ def em_retrieve_stock_rank_current() -> tuple[pd.DataFrame, int]:
                 final_data.append(item)
 
     with httpx.Client(headers=EM_HTTP_HEADERS_DEFAULT, follow_redirects=True) as client:
-        # 先请求第 1 页，拿到 total 信息
-        first_diff = fetch_page(
-            client, page=1, page_size=limit, params_template=base_params
+        # 一次请求第 1 页，同时拿到 total 与 diff
+        first_params = base_params.copy()
+        first_params["pn"] = 1
+        first_params["pz"] = limit
+        first_js = http_get_json_with_retry(
+            client, url, first_params,
+            label="get total & page1",
         )
         first_total = 0
-        # total 在 data 里
-        try:
-            first_params = base_params.copy()
-            first_params["pn"] = 1
-            first_params["pz"] = limit
-            first_resp = client.get(url, params=first_params, timeout=10.0)
-            first_resp.raise_for_status()
-            first_json = first_resp.json()
-            first_data = first_json.get("data") or {}
+        first_diff: list[dict[str, Any]] = []
+        if first_js:
+            first_data = first_js.get("data") or {}
             first_total = int(first_data.get("total", 0))
-        except Exception as e:
-            print(f"get total error: {e}", file=sys.stderr)
-
+            first_diff = first_data.get("diff") or []
         final_data.extend(first_diff)
 
         # 计算总页数
@@ -194,7 +219,7 @@ def em_retrieve_stock_rank_current() -> tuple[pd.DataFrame, int]:
                         page_data = future.result()
                         final_data.extend(page_data)
                     except Exception as e:
-                        print(f"page {page} failed: {e}", file=sys.stderr)
+                        logger.warning("page %s failed: %s", page, e)
 
         final_response_total = first_total if first_total > 0 else len(final_data)
 
