@@ -20,255 +20,6 @@ import time
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-EM_HTTP_HEADERS_DEFAULT = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-}
-
-
-def big_number_to_str(x):
-    abs_x = abs(x)
-    sign = "-" if x < 0 else ""
-    return f"{sign}{abs_x:.3f}"
-
-
-STOCK_RANK_CURRENT_COLUMN_MAPPING = {
-    "symbol": "f12",
-    "name": "f14",
-    "current_price": "f2",
-    "涨跌幅": "f3",
-    "涨跌额": "f4",
-    "成交量(手)": "f5",
-    "成交额": "f6",
-    "振幅": "f7",
-    "最高": "f15",
-    "最低": "f16",
-    "今开": "f17",
-    "昨收": "f18",
-    "量比": "f10",
-    "换手率": "f8",
-    "市盈率(动态)": "f9",
-    "60日涨跌幅": "f24",
-    "主力净流入-净额": "f62",
-    "主力净流入-净占比": "f184",
-    "超大单净流入-净额": "f66",
-    "超大单净流入-净占比": "f69",
-    "大单净流入-净额": "f72",
-    "大单净流入-净占比": "f75",
-    "中单净流入-净额": "f78",
-    "中单净流入-净占比": "f81",
-    "小单净流入-净额": "f84",
-    "小单净流入-净占比": "f87",
-}
-STOCK_CURRENT_COLUMN_MAPPING = {
-    "f12": "symbol",
-    "f14": "name",
-    "f2": "price",
-    "f4": "change",
-    "f5": "volume",
-    "f6": "amount",
-    "f15": "high",
-    "f16": "low",
-    "f17": "open",
-    "f18": "pre_close",
-    "f3": "change_rate",
-    "f7": "amplitude",
-    "f10": "volume_ratio",
-    "f8": "turnover_rate",
-}
-
-
-# 重试配置：分页请求与 get total 共用
-_EM_RETRIEVE_MAX_ATTEMPTS = 3
-_EM_RETRIEVE_RETRY_DELAY = 1.5
-_EM_RETRIEVE_HTTP_TIMEOUT = 12.0
-
-
-def http_get_json_with_retry(
-    client: httpx.Client,
-    url: str,
-    params: dict[str, Any],
-    *,
-    timeout: float = _EM_RETRIEVE_HTTP_TIMEOUT,
-    max_attempts: int = _EM_RETRIEVE_MAX_ATTEMPTS,
-    retry_delay: float = _EM_RETRIEVE_RETRY_DELAY,
-    label: str = "http",
-) -> dict[str, Any] | None:
-    """
-    使用给定 client 发起 GET 请求，解析 JSON；失败则重试，不抛错。
-    成功返回解析后的 dict，重试耗尽返回 None。
-    """
-    last_err: Exception | None = None
-    for attempt in range(max_attempts):
-        try:
-            resp = client.get(url, params=params, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last_err = e
-            logger.warning("%s attempt=%s: %s", label, attempt + 1, e)
-            if attempt < max_attempts - 1:
-                time.sleep(retry_delay)
-    logger.warning("%s exhausted retries: %s", label, last_err)
-    return None
-
-
-def em_retrieve_stock_rank_current() -> tuple[pd.DataFrame, int]:
-    """
-    获取当前全市场股票行情（多线程分页抓取，加速请求）。
-    分页请求与 get total 均带重试，失败不轻易抛错。
-    """
-    limit = 100
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    base_params = {
-        "np": "1",
-        "fltt": "1",
-        "invt": "2",
-        "fid": "f12",
-        "po": "0",  # 排序字段
-        "pn": "1",
-        "pz": "20",
-        "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2",
-        "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f24,f62,f66,f69,f72,f75,f78,f81,f84,f87,f124,f152,f184,f204,f205",
-        "dect": "1",
-        "wbp2u": "|0|0|0|web",
-    }
-
-    def fetch_page(
-        client: httpx.Client, page: int, page_size: int, params_template
-    ) -> list[dict[str, Any]]:
-        params = params_template.copy()
-        params["pn"] = page
-        params["pz"] = page_size
-        js = http_get_json_with_retry(
-            client, url, params,
-            label=f"fetch_page page={page}",
-        )
-        if not js:
-            return []
-        data: dict[str, Any] = js.get("data") or {}
-        diff: list[dict[str, Any]] = data.get("diff") or []
-        return diff
-
-    final_data: list[dict[str, Any]] = []
-    with httpx.Client(headers=EM_HTTP_HEADERS_DEFAULT, follow_redirects=True) as client:
-        index_params = {
-            "np": "1",
-            "fltt": "1",
-            "invt": "2",
-            "fid": "f12",
-            "po": "0",  # 排序字段
-            "pn": "1",
-            "pz": "50",
-            "fs": "b:MK0010",
-            "fields": "f12,f13,f14,f1,f2,f4,f3,f152,f5,f6,f18,f17,f15,f16",
-            "dect": "1",
-            "wbp2u": "|0|0|0|web",
-        }
-        index_diff = fetch_page(
-            client, page=1, page_size=limit, params_template=index_params
-        )
-        important_indexes = {
-            "000905": "SH000905",
-            "000852": "SH000852",
-            "000300": "SH000300",
-            "000001": "SH000001",
-            "399001": "SZ399001",
-        }
-        for item in index_diff:
-            if item["f12"] in important_indexes.keys():
-                item["f12"] = important_indexes[item["f12"]]
-                final_data.append(item)
-
-    with httpx.Client(headers=EM_HTTP_HEADERS_DEFAULT, follow_redirects=True) as client:
-        # 一次请求第 1 页，同时拿到 total 与 diff
-        first_params = base_params.copy()
-        first_params["pn"] = 1
-        first_params["pz"] = limit
-        first_js = http_get_json_with_retry(
-            client, url, first_params,
-            label="get total & page1",
-        )
-        first_total = 0
-        first_diff: list[dict[str, Any]] = []
-        if first_js:
-            first_data = first_js.get("data") or {}
-            first_total = int(first_data.get("total", 0))
-            first_diff = first_data.get("diff") or []
-        final_data.extend(first_diff)
-
-        # 计算总页数
-        if first_total > 0:
-            total_pages = (first_total + limit - 1) // limit
-        else:
-            # 如果拿不到 total，就保守假设最多 60 页（6000 条）
-            total_pages = 60
-
-        # 多线程抓取第 2 页到最后一页
-        pages_to_fetch = [p for p in range(2, total_pages + 1)]
-        if pages_to_fetch:
-            max_workers = max(4, len(pages_to_fetch))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_page = {
-                    executor.submit(fetch_page, client, p, limit, base_params): p
-                    for p in pages_to_fetch
-                }
-                for future in as_completed(future_to_page):
-                    page = future_to_page[future]
-                    try:
-                        page_data = future.result()
-                        final_data.extend(page_data)
-                    except Exception as e:
-                        logger.warning("page %s failed: %s", page, e)
-
-        final_response_total = first_total if first_total > 0 else len(final_data)
-
-        df = pd.DataFrame(final_data)
-        if df.empty:
-            return df, final_response_total
-
-        # Rename columns according to mapping
-        df.rename(columns=STOCK_CURRENT_COLUMN_MAPPING, inplace=True)
-        # Only keep columns specified in STOCK_CURRENT_COLUMN_MAPPING
-        wanted_cols = list(STOCK_CURRENT_COLUMN_MAPPING.values())
-        existing_cols = [c for c in wanted_cols if c in df.columns]
-        df = df[existing_cols]
-
-        # Convert price to numeric before division
-        df["price"] = pd.to_numeric(df["price"], errors="coerce") / 100.0
-        df["pre_close"] = pd.to_numeric(df["pre_close"], errors="coerce") / 100.0
-        df["open"] = pd.to_numeric(df["open"], errors="coerce") / 100.0
-        df["high"] = pd.to_numeric(df["high"], errors="coerce") / 100.0
-        df["low"] = pd.to_numeric(df["low"], errors="coerce") / 100.0
-        df["change_rate"] = pd.to_numeric(df["change_rate"], errors="coerce") / 100.0
-        df["change"] = pd.to_numeric(df["change"], errors="coerce") / 100.0
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-        df["turnover_rate"] = (
-            pd.to_numeric(df["turnover_rate"], errors="coerce") / 100.0
-        )
-        df["amplitude"] = pd.to_numeric(df["amplitude"], errors="coerce") / 100.0
-
-        # Format symbol to A-share style, e.g. 000001 -> SZ000001, 600000 -> SH600000
-        def _format_symbol(code: Any) -> Any:
-            if not isinstance(code, str) or len(code) == 0:
-                return code
-            if code[0] in ("0", "3"):  # 深市
-                return "SZ" + code
-            if code[0] == "6":  # 沪市
-                return "SH" + code
-            if code[0] in ("4", "8", "9"):  # 北交所常见代码段
-                return "BJ" + code
-            return code
-
-        if "symbol" in df.columns:
-            df["symbol"] = df["symbol"].apply(_format_symbol)
-
-        # Drop rows where price is NaN / missing
-        # df = df.dropna(subset=["price"])
-
-        return df, final_response_total
-
 def upload_stock_daily_data_to_postgres(date: str | datetime | None, df, connection_string: str, target_table_name: str, percent_ratio: int = 100):
     """
     将股票日线数据上传到 PostgreSQL 数据库。
@@ -667,9 +418,103 @@ def gtimg_get_stock_current_prices(stock_codes: list[str]) -> dict[str, dict[str
     
     return result
     
+def _is_stock_code(s: str) -> bool:
+    """判断是否为有效股票代码（如 SH600000、SZ000001、BJ430047），跳过分隔符如 --------。"""
+    if not s or len(s) < 5:
+        return False
+    s = s.strip().upper()
+    if s.startswith(("SH", "SZ", "BJ")):
+        return s[2:].isdigit()
+    return False
+
+
+def _load_symbols_from_file(symbols_path: str) -> list[str]:
+    """从 stock_symbols.txt 加载股票代码列表，每行一个（如 SZ300846、SH600000），跳过非代码行如 --------。"""
+    path = os.path.abspath(symbols_path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"股票清单文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip() and _is_stock_code(ln.strip())]
+    return lines
+
+
+def _fetch_current_prices_by_gtimg(symbols_path: str, batch_size: int = 100) -> tuple[pd.DataFrame, int]:
+    """
+    按 stock_symbols.txt 清单，每批 batch_size 只调用 gtimg_get_stock_current_prices，
+    合并结果为与 em_retrieve_stock_rank_current 兼容的 DataFrame。
+    返回 (final_data, response_total)。
+    """
+    symbols = _load_symbols_from_file(symbols_path)
+    if not symbols:
+        return pd.DataFrame(), 0
+
+    all_prices: dict[str, dict] = {}
+    max_attempts = 3
+    retry_delay = 2.0
+    print(f"{datetime.now()} start fetch current prices by gtimg, symbols count: {len(symbols)}")
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i : i + batch_size]
+        batch_start = i + 1
+        batch_end = min(i + batch_size, len(symbols))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                batch_prices = gtimg_get_stock_current_prices(batch)
+                if batch_prices:
+                    all_prices.update(batch_prices)
+                    break
+                logger.warning(
+                    "gtimg batch %d-%d attempt %d/%d returned empty",
+                    batch_start, batch_end, attempt, max_attempts,
+                )
+            except Exception as e:
+                logger.warning(
+                    "gtimg batch %d-%d attempt %d/%d failed: %s",
+                    batch_start, batch_end, attempt, max_attempts, e,
+                )
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+        else:
+            logger.error("gtimg batch %d-%d failed after %d attempts", batch_start, batch_end, max_attempts)
+        time.sleep(1)
+    print(f"{datetime.now()} end fetch current prices by gtimg, symbols count: {len(symbols)}")
+
+    if not all_prices:
+        return pd.DataFrame(), 0
+
+    rows = []
+    for symbol, info in all_prices.items():
+        # gtimg 返回 close/price, open, high, low, volume, amount, pre_close, change, change_percent
+        change_rate = info.get("change_percent", 0.0)
+        if isinstance(change_rate, (int, float)) and abs(change_rate) > 1:
+            change_rate = change_rate / 100.0  # 若为百分比数值则转为小数
+        pre_close = info.get("pre_close") or 0.0
+        high = info.get("high", 0.0)
+        low = info.get("low", 0.0)
+        amplitude = (high - low) / pre_close if pre_close and pre_close > 0 else 0.0
+        rows.append({
+            "symbol": symbol,
+            "price": info.get("close") or info.get("price", 0.0),
+            "open": info.get("open", 0.0),
+            "high": high,
+            "low": low,
+            "volume": info.get("volume", 0),
+            "amount": info.get("amount", 0.0),
+            "pre_close": pre_close,
+            "change": info.get("change", 0.0),
+            "change_rate": change_rate,
+            "amplitude": amplitude,
+            "name": info.get("name", ""),
+        })
+    final_data = pd.DataFrame(rows)
+    response_total = len(final_data)
+    return final_data, response_total
+
+    
 today_date = datetime.now().date()
 
-final_data, response_total = em_retrieve_stock_rank_current()
+# 使用 gtimg 接口，按 stock_symbols.txt 清单每 100 只一批拉取
+symbols_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_symbols.txt")
+final_data, response_total = _fetch_current_prices_by_gtimg(symbols_path, batch_size=100)
 print(f"final_data: \n{final_data}")
 print(f"response_total: \n{response_total}")
 
