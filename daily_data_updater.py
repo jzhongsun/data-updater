@@ -282,10 +282,10 @@ def gtimg_get_stock_current_prices(stock_codes: list[str]) -> dict[str, dict[str
     # 转换为API格式
     api_codes = [_convert_to_api_format(code) for code in stock_codes]
     # 构建URL
-    url = f"https://qt.gtimg.cn/q={','.join(api_codes)}"
+    url = f"http://qt.gtimg.cn/q={','.join(api_codes)}"
     
     try:
-        with httpx.Client(headers=EM_HTTP_HEADERS_DEFAULT, timeout=10.0) as client:
+        with httpx.Client(headers={}, timeout=10.0) as client:
             response = client.get(url)
             response.raise_for_status()
             content = response.text
